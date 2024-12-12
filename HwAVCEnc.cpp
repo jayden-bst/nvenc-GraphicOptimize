@@ -48,11 +48,14 @@
         }                                                                                                          \
     } while (0)
 
-#define AVC_ENCODE_GUID NV_ENC_CODEC_H264_GUID
+#define H264_ENCODE_GUID NV_ENC_CODEC_H264_GUID
+#define AV1_ENCODE_GUID NV_ENC_CODEC_AV1_GUID
 #define AVC_PRESET_GUID NV_ENC_PRESET_P2_GUID
-#define AVC_TURING_INFO NV_ENC_TUNING_INFO_LOW_LATENCY
+#define AVC_TUNING_INFO NV_ENC_TUNING_INFO_LOW_LATENCY
 
 QpData qpData;
+int encSessionsCount = 0;         // number of active encoder sessions running
+bool pauseStream = false;
 ColorBufferSet avcCbSet;
 
 typedef enum {
@@ -87,9 +90,12 @@ typedef struct
     EGLSurface                      eglSurface;
     EGLContext                      eglContext;
     BufferMap_t                     bufferMap;
+    bool                            isIVS;       // for live streaming through AWS-IVS
+    GLuint                          overwriteTex;   // for paused stream
+    NvEncBufferInfo*                overwriteNvencBufInfo;
 } AVCEncoderContext;
 
-dynQpDeltaAdjustMsg* dynQpAdjPtr = NULL;
+dynQpDeltaAdjustMsg* dynQpAdjust= NULL;
 #define BYTES2BITS(a)    ((a)*8)
 
 inline int dynQpDeltaAdjustMsg::elapsedTimeMs(timeval startTime){
@@ -100,67 +106,62 @@ inline int dynQpDeltaAdjustMsg::elapsedTimeMs(timeval startTime){
     return elapsed_time;
  }
 
-dynQpDeltaAdjustMsg::dynQpDeltaAdjustMsg() {
-    // init dynamic qpDelta parameters Resource
+dynQpDeltaAdjustMsg::dynQpDeltaAdjustMsg(void* encMsgPtr) {
     dynQpDeltaAdjust_set_mDynQpAdjustReady(false);
     dynQpDeltaAdjust_set_mDynQpAdjustAllowed(false);
-    dynQpDeltaAdjust_set_mMinAdjustThreshold(0);
     dynQpDeltaAdjust_set_mMaxAdjustThreshold(12);
     dynQpDeltaAdjust_set_mPrevBrtCondition((int)LOW_BITRATE);
     dynQpDeltaAdjust_set_mQpDeltaMode(REMAIN);
     dynQpDeltaAdjust_set_kStaticPeriodMs(1000lu);
-    dynQpDeltaAdjust_set_kLowWaterMarkBits(1000lu * 1000);
-    dynQpDeltaAdjust_set_kMediumWaterMarkBits((2000lu * 1000));
-    dynQpDeltaAdjust_set_kRatedWaterMarkBits(2500lu * 1000);
-    dynQpDeltaAdjust_set_kHighWaterMarkBits(3500lu* 1000);
-    dynQpDeltaAdjust_set_kExHighWaterMarkBits(5000lu * 1000);
     dynQpDeltaAdjust_set_kTotalEncodedSizeInBytes(0lu);
     timeval curTime 		 = {0};
     gettimeofday(&curTime, NULL);
     dynQpDeltaAdjust_set_kCalStartTime(curTime);
-    //kCheckStartTime = kCalStartTime;
-    HDLOGE(":::: %s jayden test dynQpDeltaAdjustMsg, mMinAdjustThreshold: %d, mDynQpAdjustAllowed: %d, LowWaterMarkBits: %d, kStaticPeriodMs: %d, mQpDeltaMode: %d", __FUNCTION__, dynQpDeltaAdjust_get_mMinAdjustThreshold(),
-		mDynQpAdjustAllowed, kLowWaterMarkBits, kStaticPeriodMs, mQpDeltaMode);
+    AVCEncoderContext* ctx = (AVCEncoderContext*)encMsgPtr;
+    int fps = ctx->reconfigParams.reInitEncodeParams.frameRateNum;
+    dynQpDeltaAdjust_set_mMinFpsRequired(fps >> 1);
+    if (ctx->width * ctx->height < 1080 * 1920) {
+        dynQpDeltaAdjust_set_kLowWaterMarkBits(1000lu * 1000);
+        dynQpDeltaAdjust_set_kMediumWaterMarkBits((1500lu * 1000));
+        dynQpDeltaAdjust_set_kRatedWaterMarkBits(2500lu * 1000);
+        dynQpDeltaAdjust_set_kHighWaterMarkBits(3000lu* 1000);
+        dynQpDeltaAdjust_set_kExHighWaterMarkBits(5000lu * 1000);
+        dynQpDeltaAdjust_set_mMinAdjustThreshold(3);
+        qpData.qpValueOffset    = 2;
+    } else {
+        dynQpDeltaAdjust_set_kLowWaterMarkBits(2000lu * 1000);
+        dynQpDeltaAdjust_set_kMediumWaterMarkBits((6000lu * 1000));
+        dynQpDeltaAdjust_set_kRatedWaterMarkBits(10000lu * 1000);
+        dynQpDeltaAdjust_set_kHighWaterMarkBits(12000lu* 1000);
+        dynQpDeltaAdjust_set_kExHighWaterMarkBits(14000lu * 1000);
+        dynQpDeltaAdjust_set_mMinAdjustThreshold(3);
+        qpData.qpValueOffset    = 0;
+    }
+    qpData.lowBitQpValue    = 5;
+    qpData.mediumBitQpValue = 4;
+    qpData.highBitQpValue   = 3;
 }
-
-/***
-   need to check the network condition before using it, and in order to skip the the game launch and loading phase,
-   we should activate it only after the bitrate and fps are stable
-that are:
-    1: the bitrate is higher than minBitrate for at least 15 times in 1 sec
-    2: condition 1 was meet continouly for at least 30 times
-    3: if the instance was created for more than 5 mins, that means the loading phase has been skipped, it's also the right timing.
-should activate the dynamic qpdelta adjustment algorithm until meet conditions 1 and 2 or condition 3
-***/
 
 bool dynQpDeltaAdjustMsg::checkDynQpAdjustAllowed(uint32_t& suitableBrtNumInSec, uint32_t bitrate) {
     bool allowed                         = false;
     static int continousBrtSuitableTimes = 0;
     static timeval nowTimeMs             = kCalStartTime;
-
-    if (elapsedTimeMs(nowTimeMs) > kStaticPeriodMs * 60 * 5) {
+    if (elapsedTimeMs(kCalStartTime) > kStaticPeriodMs * 60 * 2) {
         allowed             = true;
         suitableBrtNumInSec = 0;
-        HDLOGE(":::: %s jayden test checkDynQpAdjustAllowed 5min arrived!!!!", __FUNCTION__);
         return allowed;
     }
-
     if (elapsedTimeMs(nowTimeMs) > kStaticPeriodMs) {
         if (suitableBrtNumInSec > mMinFpsRequired) {
-/*            HDLOGE("jayden test checkDynQpAdjustAllowed mMinFpsRequired: %d, suitableBrtNumInSec: %d, continousBrtSuitableTimes: %d, bitrate: %d",dynQpDeltaAdjust_get_mMinFpsRequired(), 
-                             suitableBrtNumInSec,
-                             continousBrtSuitableTimes, bitrate);*/
             continousBrtSuitableTimes++;
             gettimeofday(&nowTimeMs, NULL);
             if (continousBrtSuitableTimes > 30) {
                 allowed             = true;
                 suitableBrtNumInSec = 0;
                 continousBrtSuitableTimes = 0;
-                HDLOGE("jayden test checkDynQpAdjustAllowed suitable times found, continousBrtSuitableTimes: %d!!!!", continousBrtSuitableTimes);
                 return allowed;
             }
         } else {
-            //HDLOGE("jayden test checkDynQpAdjustAllowed suitableBrtNumInSec not meet condition, reset all to 0, suitableBrtNumInSec: %d, bitrate: %d", suitableBrtNumInSec, bitrate);
             continousBrtSuitableTimes = 0;
             gettimeofday(&nowTimeMs, NULL);
         }
@@ -169,9 +170,7 @@ bool dynQpDeltaAdjustMsg::checkDynQpAdjustAllowed(uint32_t& suitableBrtNumInSec,
     return allowed;
 }
 
-// if the time of encodedSizeInBits less than kLowWaterMarkBits last for more than 3ms, judge it as true.
 bool dynQpDeltaAdjustMsg::isGameScreenMotionless() {
-    //static uint64_t prevTotalEncodedSizeInBytes = 0;
     uint32_t encodedSizeInBits  = BYTES2BITS(kTotalEncodedSizeInBytes);
     bool     ret                = false;
     static timeval presentTime  = {0};
@@ -180,30 +179,23 @@ bool dynQpDeltaAdjustMsg::isGameScreenMotionless() {
         if (!startMarked) {
             gettimeofday(&presentTime, NULL);
             startMarked = true;
-            HDLOGE(":::: %s jayden test start mark now, EncodedSizeInBits : %d, kLowWaterMarkBits: %d....", __FUNCTION__, encodedSizeInBits, kLowWaterMarkBits);
         }
         if (startMarked && elapsedTimeMs(presentTime) > 3 * kStaticPeriodMs) {
-            HDLOGE(":::: %s jayden test end mark now, kStaticPeriodMs: %d.", __FUNCTION__, kStaticPeriodMs);
             ret = true;
         }
     } else {
         startMarked = false;
         ret = false;
     }
-    if (ret)
-        HDLOGE(":::: %s jayden test return %d!!!!", __FUNCTION__, ret);
-    //ret = (EncodedSizeInBits <= kLowWaterMarkBits / 2 && prevTotalEncodedSizeInBytes <= kLowWaterMarkBits / 2 /*|| ratedBrtNumInSec > minFpsRequired*/) ? true : false;
-    //prevTotalEncodedSizeInBytes = EncodedSizeInBits;
     return ret;
 }
 
 void* dynQpDeltaAdjustMsg::qpDeltaModeSelect(uint32_t encodedSizeInBytes, uint32_t &suitableBrtNumInSec) {
     static qpDeltaMode ope = REMAIN;
-    if (elapsedTimeMs(kCalStartTime) >= kStaticPeriodMs) { // using current dynamic qpdelta adjustment strategy at least one second
+    if (elapsedTimeMs(kCalStartTime) >= kStaticPeriodMs) {
         kTotalEncodedSizeInBytes   = encodedSizeInBytes;
         uint32_t encodedSizeInBits = BYTES2BITS(kTotalEncodedSizeInBytes);
         bool isMotionless = isGameScreenMotionless();
-        HDLOGE(":::: %s jayden test encodedSize %d byte, EncodedSizeInBits: %f Mbit, qpdelta Mode: %d!!!!", __FUNCTION__, encodedSizeInBytes, (float)encodedSizeInBits/(1024*1024), (int)ope);
         mDynQpAdjustReady = true;
         kTotalEncodedSizeInBytes =  0;
         suitableBrtNumInSec      =  0;
@@ -212,60 +204,54 @@ void* dynQpDeltaAdjustMsg::qpDeltaModeSelect(uint32_t encodedSizeInBytes, uint32
         kCalStartTime = curTime;
         if (encodedSizeInBits > kHighWaterMarkBits) {
             ope = encodedSizeInBits < kExHighWaterMarkBits ? INCREASE_STEADILY: INCREASE_RAPIDLY;
-            return &ope;
         } else if ((encodedSizeInBits >= kRatedWaterMarkBits &&
                    encodedSizeInBits <= kHighWaterMarkBits) || isMotionless) {
             ope = REMAIN;
-            return &ope;
         } else  {
             ope = encodedSizeInBits >= kMediumWaterMarkBits ? DECREASE_STEADILY: DECREASE_RAPIDLY;
-            return &ope;
         }
     } else {
         kTotalEncodedSizeInBytes   = encodedSizeInBytes;
         mDynQpAdjustReady = false;
         ope = REMAIN;
-        return &ope;
     }
+    return &ope;
 }
 
-int dynQpDeltaAdjustMsg::qpDeltaOperation(bool bitrateNotJump, int qpDelValue){
+int dynQpDeltaAdjustMsg::qpDeltaOperation(bool bitrateNotJump, int qpDelValue) {
     int val          = qpDelValue;
     qpDeltaMode mode = (qpDeltaMode)mQpDeltaMode;
-    HDLOGE(":::: %s jayden test qpDeltaOperation, mode: %d, bitrateNotJump: %d, qpDelValue:%d!!!!", __FUNCTION__, mode, bitrateNotJump, qpDelValue);
 
     if (bitrateNotJump == false || mDynQpAdjustReady == false)
         goto ret;
 
     switch (mode) {
         case REMAIN:
-            goto ret;
+            break;
         case INCREASE_STEADILY: {
             if (qpDelValue + 1 <= mMaxAdjustThreshold)
                 val = qpDelValue + 1;
-            return val;
+            break;
         }
         case INCREASE_RAPIDLY: {
             if (qpDelValue + 2 <= mMaxAdjustThreshold)
                 val = qpDelValue + 2;
-            return val;
+            break;
         }
         case DECREASE_STEADILY: {
             if (qpDelValue - 1 >= mMinAdjustThreshold)
                 val = qpDelValue - 1;
-            return val;
+            break;
         }
         case DECREASE_RAPIDLY: {
             if (qpDelValue - 2 >= mMinAdjustThreshold)
                 val= qpDelValue - 2;
-            return val;
+            break;
         }
         default:
-            HDLOGE(":::: %s jayden test invalid qpDeltaOperation!!!!", __FUNCTION__);
-            goto ret;
+            break;
     }
 ret:
-    HDLOGW(":::: %s jayden test dynamic qpDeltaOperation not used!!!!", __FUNCTION__);
     return val;
 }
 
@@ -328,9 +314,50 @@ static void destroyEGLResources(AVCEncoderContext* ctx)
         eglDestroySurface(dpy, ctx->eglSurface);
 }
 
-AVCEncCtx AVCCreateEncoder(int width, int height, int fps, int bitrate)
+static bool AVCPrepareIOBuffers(AVCEncoderContext* ctx, NvEncBufferInfo* nvencBufInfo, GLuint tex)
+{
+    nvencBufInfo->resource.texture = tex;
+    nvencBufInfo->resource.target = GL_TEXTURE_2D;
+
+    // register input resource
+    NV_ENC_REGISTER_RESOURCE registerResource = { NV_ENC_REGISTER_RESOURCE_VER };
+    registerResource.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_OPENGL_TEX;
+    registerResource.width = ctx->width;
+    registerResource.height = ctx->height;
+    registerResource.pitch = ctx->width * 4;
+    registerResource.subResourceIndex = 0;
+    registerResource.resourceToRegister = &(nvencBufInfo->resource);
+    registerResource.bufferFormat = ctx->format;
+    registerResource.bufferUsage = NV_ENC_INPUT_IMAGE;
+    NVENC_API_CALL_RET(ctx->nvenc.nvEncRegisterResource(ctx->encoder, &registerResource), false);
+
+    nvencBufInfo->mapInputResource = { NV_ENC_MAP_INPUT_RESOURCE_VER };
+    nvencBufInfo->mapInputResource.registeredResource = registerResource.registeredResource;
+
+    nvencBufInfo->picParams = { NV_ENC_PIC_PARAMS_VER };
+    nvencBufInfo->picParams.inputWidth = ctx->width;
+    nvencBufInfo->picParams.inputHeight = ctx->height;
+    nvencBufInfo->picParams.inputPitch = ctx->width * 4;
+    nvencBufInfo->picParams.inputBuffer = nvencBufInfo->mapInputResource.mappedResource;
+    nvencBufInfo->picParams.bufferFmt = ctx->format;
+    nvencBufInfo->picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+
+    // create bitstream buffer for output
+    NV_ENC_CREATE_BITSTREAM_BUFFER createBitstreamBuffer = { NV_ENC_CREATE_BITSTREAM_BUFFER_VER };
+    NVENC_API_CALL_RET(ctx->nvenc.nvEncCreateBitstreamBuffer(ctx->encoder, &createBitstreamBuffer), false);
+    nvencBufInfo->picParams.outputBitstream = createBitstreamBuffer.bitstreamBuffer;
+
+    nvencBufInfo->lockBitstreamData = { NV_ENC_LOCK_BITSTREAM_VER };
+    nvencBufInfo->lockBitstreamData.outputBitstream = createBitstreamBuffer.bitstreamBuffer;
+    nvencBufInfo->lockBitstreamData.doNotWait = 0;
+
+    return true;
+}
+
+AVCEncCtx AVCCreateEncoder(int codec, int width, int height, int fps, int bitrate)
 {
     AVCEncoderContext* ctx = new AVCEncoderContext;
+    Codec codecType = (Codec)codec;
     ctx->width = width;
     ctx->height = height;
     ctx->bitrate = bitrate;
@@ -375,7 +402,6 @@ AVCEncCtx AVCCreateEncoder(int width, int height, int fps, int bitrate)
 
     ctx->reconfigParams = { NV_ENC_RECONFIGURE_PARAMS_VER };
     ctx->reconfigParams.reInitEncodeParams = { NV_ENC_INITIALIZE_PARAMS_VER };
-    ctx->reconfigParams.reInitEncodeParams.encodeGUID = AVC_ENCODE_GUID;
     ctx->reconfigParams.reInitEncodeParams.presetGUID = AVC_PRESET_GUID;
     ctx->reconfigParams.reInitEncodeParams.encodeWidth = width;
     ctx->reconfigParams.reInitEncodeParams.encodeHeight = height;
@@ -391,9 +417,35 @@ AVCEncCtx AVCCreateEncoder(int width, int height, int fps, int bitrate)
     ctx->reconfigParams.reInitEncodeParams.enableOutputInVidmem = 0;
 
     NV_ENC_PRESET_CONFIG presetConfig = { NV_ENC_PRESET_CONFIG_VER, { NV_ENC_CONFIG_VER } };
-    NVENC_API_CALL_RET(ctx->nvenc.nvEncGetEncodePresetConfigEx(ctx->encoder, AVC_ENCODE_GUID, AVC_PRESET_GUID, AVC_TURING_INFO, &presetConfig), 0);
     ctx->reconfigParams.reInitEncodeParams.encodeConfig = new NV_ENC_CONFIG;
-    memcpy(ctx->reconfigParams.reInitEncodeParams.encodeConfig, &(presetConfig.presetCfg), sizeof(NV_ENC_CONFIG));
+
+    switch (codecType) {
+        case AV1:
+            qpData.isQpEnabled = false;     // don't use qp for av1 codec
+            ctx->reconfigParams.reInitEncodeParams.encodeGUID = AV1_ENCODE_GUID;
+            NVENC_API_CALL_RET(ctx->nvenc.nvEncGetEncodePresetConfigEx(ctx->encoder, AV1_ENCODE_GUID, AVC_PRESET_GUID, AVC_TUNING_INFO, &presetConfig), 0);
+            memcpy(ctx->reconfigParams.reInitEncodeParams.encodeConfig, &(presetConfig.presetCfg), sizeof(NV_ENC_CONFIG));
+
+            ctx->reconfigParams.reInitEncodeParams.encodeConfig->profileGUID = NV_ENC_AV1_PROFILE_MAIN_GUID;
+            ctx->reconfigParams.reInitEncodeParams.encodeConfig->encodeCodecConfig.av1Config.level = NV_ENC_LEVEL_AV1_AUTOSELECT;
+            ctx->reconfigParams.reInitEncodeParams.encodeConfig->encodeCodecConfig.av1Config.useBFramesAsRef = NV_ENC_BFRAME_REF_MODE_DISABLED;
+            break;
+
+        case H264:
+            ctx->reconfigParams.reInitEncodeParams.encodeGUID = H264_ENCODE_GUID;
+            NVENC_API_CALL_RET(ctx->nvenc.nvEncGetEncodePresetConfigEx(ctx->encoder, H264_ENCODE_GUID, AVC_PRESET_GUID, AVC_TUNING_INFO, &presetConfig), 0);
+            memcpy(ctx->reconfigParams.reInitEncodeParams.encodeConfig, &(presetConfig.presetCfg), sizeof(NV_ENC_CONFIG));
+
+            ctx->reconfigParams.reInitEncodeParams.encodeConfig->profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
+            ctx->reconfigParams.reInitEncodeParams.encodeConfig->encodeCodecConfig.h264Config.level = NV_ENC_LEVEL_AUTOSELECT;
+            ctx->reconfigParams.reInitEncodeParams.encodeConfig->encodeCodecConfig.h264Config.repeatSPSPPS = 1;
+            ctx->reconfigParams.reInitEncodeParams.encodeConfig->encodeCodecConfig.h264Config.disableSPSPPS = 0;
+            break;
+
+        default:
+            HDLOGE(":::: Invalid codecType=%d\n", codecType);
+            return 0;
+    }
 
     ctx->reconfigParams.reInitEncodeParams.encodeConfig->rcParams.averageBitRate = bitrate;
     //ctx->reconfigParams.reInitEncodeParams.encodeConfig->rcParams.maxBitRate = bitrate;
@@ -406,9 +458,6 @@ AVCEncCtx AVCCreateEncoder(int width, int height, int fps, int bitrate)
     //ctx->reconfigParams.reInitEncodeParams.encodeConfig->rcParams.disableBadapt = 1;
     //ctx->reconfigParams.reInitEncodeParams.encodeConfig->frameIntervalP = 1;
     ctx->reconfigParams.reInitEncodeParams.encodeConfig->rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
-    ctx->reconfigParams.reInitEncodeParams.encodeConfig->encodeCodecConfig.h264Config.level = NV_ENC_LEVEL_H264_42;
-    ctx->reconfigParams.reInitEncodeParams.encodeConfig->encodeCodecConfig.h264Config.repeatSPSPPS = 1;
-    ctx->reconfigParams.reInitEncodeParams.encodeConfig->encodeCodecConfig.h264Config.disableSPSPPS = 0;
     //ctx->reconfigParams.reInitEncodeParams.encodeConfig->encodeCodecConfig.h264Config.enableConstrainedEncoding = 1;
     //ctx->reconfigParams.reInitEncodeParams.encodeConfig->encodeCodecConfig.h264Config.enableIntraRefresh = 1;
     //ctx->reconfigParams.reInitEncodeParams.encodeConfig->encodeCodecConfig.h264Config.intraRefreshPeriod = 30;
@@ -418,6 +467,11 @@ AVCEncCtx AVCCreateEncoder(int width, int height, int fps, int bitrate)
     //ctx->reconfigParams.reInitEncodeParams.encodeConfig->encodeCodecConfig.h264Config.maxTemporalLayers = 2;
 
     if (qpData.isQpEnabled) {
+
+        if (qpData.isDynamicMode()) {
+            dynQpAdjust = new dynQpDeltaAdjustMsg(ctx);
+            HDLOGI("%s: Dynamic Qpdelta adjustment algorithm take effect\n", __FUNCTION__);
+        }
         ctx->reconfigParams.reInitEncodeParams.encodeConfig->rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
         HDLOGI("%s: QP is enabled, lowBitQpValue=%d, mediumBitQpValue=%d, highBitQpValue=%d, qpValueOffset=%d\n", __FUNCTION__, qpData.lowBitQpValue, qpData.mediumBitQpValue, qpData.highBitQpValue, qpData.qpValueOffset);
 
@@ -429,22 +483,44 @@ AVCEncCtx AVCCreateEncoder(int width, int height, int fps, int bitrate)
         qpData.heightInMBs = ((height + 15) & ~15) >> 4;
         qpData.qpDeltaMapArraySize  = qpData.widthInMBs * qpData.heightInMBs;
         qpData.qpDeltaMapArray      = (int8_t*) malloc(qpData.qpDeltaMapArraySize * sizeof(int8_t));
-        memset(qpData.qpDeltaMapArray, 0, qpData.qpDeltaMapArraySize);HDLOGE("jayden test create dynQpAdjPtr start, fps: %d", fps>>1);
-        dynQpAdjPtr = new dynQpDeltaAdjustMsg;
-        dynQpAdjPtr->dynQpDeltaAdjust_set_mMinFpsRequired(fps>>1);
+        memset(qpData.qpDeltaMapArray, 0, qpData.qpDeltaMapArraySize);
     }
     else {
         HDLOGI("%s: QP is disabled\n", __FUNCTION__);
-        ctx->reconfigParams.reInitEncodeParams.encodeConfig->profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
     }
 
     ctx->reconfigParams.reInitEncodeParams.maxEncodeWidth = width;
     ctx->reconfigParams.reInitEncodeParams.maxEncodeHeight = height;
-    ctx->reconfigParams.reInitEncodeParams.tuningInfo = AVC_TURING_INFO;
+    ctx->reconfigParams.reInitEncodeParams.tuningInfo = AVC_TUNING_INFO;
 
     NVENC_API_CALL_RET(ctx->nvenc.nvEncInitializeEncoder(ctx->encoder, &(ctx->reconfigParams.reInitEncodeParams)), 0);
 
-    HDLOGI("AVC encoder created=0x%" PRIx64 " width=%d height=%d fps=%d bitrate=%d minBitrate=%d\n", (AVCEncCtx)ctx, width, height, fps, bitrate, ctx->minBitrate);
+    if (!encSessionsCount)
+        ctx->isIVS = false;      // streamer
+    else
+        ctx->isIVS = true;
+    encSessionsCount++;
+
+    if (ctx->isIVS) {
+        glGenTextures(1, &ctx->overwriteTex);
+        glBindTexture(GL_TEXTURE_2D, ctx->overwriteTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ctx->width, ctx->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        ctx->overwriteNvencBufInfo = new NvEncBufferInfo;
+        if (!AVCPrepareIOBuffers(ctx, ctx->overwriteNvencBufInfo, ctx->overwriteTex)) {
+            glDeleteTextures(1, &ctx->overwriteTex);
+            ctx->overwriteTex = 0;
+            delete ctx->overwriteNvencBufInfo;
+            ctx->overwriteNvencBufInfo = NULL;
+        }
+    }
+    else {
+        ctx->overwriteTex = 0;
+        ctx->overwriteNvencBufInfo = NULL;
+    }
+
+    HDLOGI("AVC encoder created=0x%" PRIx64 " codec=%s width=%d height=%d fps=%d bitrate=%d minBitrate=%d encSessionsCount=%d isIVS=%d\n", (AVCEncCtx)ctx, (codecType==AV1)?"AV1":"H264", width, height, fps, bitrate, ctx->minBitrate, encSessionsCount, ctx->isIVS);
     return (AVCEncCtx) ctx;
 }
 
@@ -492,49 +568,27 @@ static void useQpdeltaStrategy(NvEncBufferInfo* nvencBufInfo, uint32_t bitrate) 
     bc = (bitrate > 2000000) ? ( bitrate >= 2500000 ? HIGH_BITRATE : MEDIUM_BITRATE) : LOW_BITRATE;
 
     nvencBufInfo->picParams.qpDeltaMapSize = qpData.qpDeltaMapArraySize;
-
     switch (bc) {
         case HIGH_BITRATE:
-            if (dynQpAdjPtr != nullptr){
-                // adjusting based on the prev state of HIGH_BITRATE
-                int curHighQpValue = qpData.highBitQpValue;
-                if (dynQpAdjPtr->dynQpDeltaAdjust_get_mDynQpAdjustReady()) {
-                    bitrateCondition prevBrtCond = (bitrateCondition)dynQpAdjPtr->dynQpDeltaAdjust_get_mPrevBrtCondition();
-                    qpData.highBitQpValue = dynQpAdjPtr->qpDeltaOperation(prevBrtCond == bc, curHighQpValue);
-                    HDLOGE(":::: %s jayden test, after qpDeltaOperation in high bit case, highBitQpValue: %d, mediumBitQpValue: %d, lowBitQpValue: %d",
-						  __FUNCTION__, qpData.highBitQpValue, qpData.mediumBitQpValue, qpData.lowBitQpValue);
-                    dynQpAdjPtr->dynQpDeltaAdjust_set_mDynQpAdjustReady(false);
-                }
+            if (dynQpAdjust && dynQpAdjust->dynQpDeltaAdjust_get_mDynQpAdjustReady()){
+                bitrateCondition prevBrtCond = (bitrateCondition)dynQpAdjust->dynQpDeltaAdjust_get_mPrevBrtCondition();
+                qpData.highBitQpValue = dynQpAdjust->qpDeltaOperation(prevBrtCond == bc, qpData.highBitQpValue);
             }
             RegionOfInterestOpt(qpData.highBitQpValue, qpData.highBitQpValue*1.2, centralOptimization);
             nvencBufInfo->picParams.qpDeltaMap = qpData.qpDeltaMapArray;
             break;
         case MEDIUM_BITRATE:
-            if (dynQpAdjPtr != nullptr){
-                // adjusting based on the prev state of MEDIUM_BITRATE
-                int curMediumQpValue = qpData.mediumBitQpValue;
-                if (dynQpAdjPtr->dynQpDeltaAdjust_get_mDynQpAdjustReady()) {
-                    bitrateCondition prevBrtCond = (bitrateCondition)dynQpAdjPtr->dynQpDeltaAdjust_get_mPrevBrtCondition();
-                    qpData.mediumBitQpValue = dynQpAdjPtr->qpDeltaOperation(prevBrtCond == bc, curMediumQpValue);
-                    dynQpAdjPtr->dynQpDeltaAdjust_set_mDynQpAdjustReady(false);
-                    HDLOGE(":::: %s jayden test, after qpDeltaOperation in medium bit case, highBitQpValue: %d, mediumBitQpValue: %d, lowBitQpValue: %d",
-                                               __FUNCTION__, qpData.highBitQpValue, qpData.mediumBitQpValue, qpData.lowBitQpValue);
-                }
+            if (dynQpAdjust && dynQpAdjust->dynQpDeltaAdjust_get_mDynQpAdjustReady()){
+                bitrateCondition prevBrtCond = (bitrateCondition)dynQpAdjust->dynQpDeltaAdjust_get_mPrevBrtCondition();
+                qpData.mediumBitQpValue = dynQpAdjust->qpDeltaOperation(prevBrtCond == bc, qpData.mediumBitQpValue);
             }
             RegionOfInterestOpt(qpData.mediumBitQpValue - qpData.qpValueOffset , qpData.mediumBitQpValue + qpData.qpValueOffset, centralOptimization);
             nvencBufInfo->picParams.qpDeltaMap  = qpData.qpDeltaMapArray;
             break;
         case LOW_BITRATE:
-            if (dynQpAdjPtr != nullptr){
-                // adjusting based on the prev state of LOW_BITRATE
-                int curLowQpValue = qpData.lowBitQpValue;
-                if (dynQpAdjPtr->dynQpDeltaAdjust_get_mDynQpAdjustReady()) {
-                    bitrateCondition prevBrtCond = (bitrateCondition)dynQpAdjPtr->dynQpDeltaAdjust_get_mPrevBrtCondition();
-                    qpData.lowBitQpValue = dynQpAdjPtr->qpDeltaOperation(prevBrtCond == bc, curLowQpValue);
-                    dynQpAdjPtr->dynQpDeltaAdjust_set_mDynQpAdjustReady(false);
-                    HDLOGE(":::: %s jayden test, after qpDeltaOperation in low bit case, highBitQpValue: %d, mediumBitQpValue: %d, lowBitQpValue: %d",
-                                        __FUNCTION__, qpData.highBitQpValue, qpData.mediumBitQpValue, qpData.lowBitQpValue);
-                }
+            if (dynQpAdjust && dynQpAdjust->dynQpDeltaAdjust_get_mDynQpAdjustReady()){
+                bitrateCondition prevBrtCond = (bitrateCondition)dynQpAdjust->dynQpDeltaAdjust_get_mPrevBrtCondition();
+                qpData.lowBitQpValue = dynQpAdjust->qpDeltaOperation(prevBrtCond == bc, qpData.lowBitQpValue);
             }
             RegionOfInterestOpt(qpData.lowBitQpValue - qpData.qpValueOffset, qpData.lowBitQpValue + qpData.qpValueOffset, centralOptimization);
             nvencBufInfo->picParams.qpDeltaMap  = qpData.qpDeltaMapArray;
@@ -543,49 +597,12 @@ static void useQpdeltaStrategy(NvEncBufferInfo* nvencBufInfo, uint32_t bitrate) 
             HDLOGE(":::: %s invalid qpdelta mode setting!!!", __FUNCTION__);
             break;
     }
-	if (dynQpAdjPtr != nullptr) dynQpAdjPtr->dynQpDeltaAdjust_set_mPrevBrtCondition((int)bc);
+
+    if (dynQpAdjust && dynQpAdjust->dynQpDeltaAdjust_get_mDynQpAdjustReady()) {
+        dynQpAdjust->dynQpDeltaAdjust_set_mPrevBrtCondition((int)bc);
+        dynQpAdjust->dynQpDeltaAdjust_set_mDynQpAdjustReady(false);
+    }
     return;
-}
-
-
-static bool AVCPrepareIOBuffers(AVCEncoderContext* ctx, NvEncBufferInfo* nvencBufInfo, GLuint tex)
-{
-    nvencBufInfo->resource.texture = tex;
-    nvencBufInfo->resource.target = GL_TEXTURE_2D;
-
-    // register input resource
-    NV_ENC_REGISTER_RESOURCE registerResource = { NV_ENC_REGISTER_RESOURCE_VER };
-    registerResource.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_OPENGL_TEX;
-    registerResource.width = ctx->width;
-    registerResource.height = ctx->height;
-    registerResource.pitch = ctx->width * 4;
-    registerResource.subResourceIndex = 0;
-    registerResource.resourceToRegister = &(nvencBufInfo->resource);
-    registerResource.bufferFormat = ctx->format;
-    registerResource.bufferUsage = NV_ENC_INPUT_IMAGE;
-    NVENC_API_CALL_RET(ctx->nvenc.nvEncRegisterResource(ctx->encoder, &registerResource), false);
-
-    nvencBufInfo->mapInputResource = { NV_ENC_MAP_INPUT_RESOURCE_VER };
-    nvencBufInfo->mapInputResource.registeredResource = registerResource.registeredResource;
-
-    nvencBufInfo->picParams = { NV_ENC_PIC_PARAMS_VER };
-    nvencBufInfo->picParams.inputWidth = ctx->width;
-    nvencBufInfo->picParams.inputHeight = ctx->height;
-    nvencBufInfo->picParams.inputPitch = ctx->width * 4;
-    nvencBufInfo->picParams.inputBuffer = nvencBufInfo->mapInputResource.mappedResource;
-    nvencBufInfo->picParams.bufferFmt = ctx->format;
-    nvencBufInfo->picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
-
-    // create bitstream buffer for output
-    NV_ENC_CREATE_BITSTREAM_BUFFER createBitstreamBuffer = { NV_ENC_CREATE_BITSTREAM_BUFFER_VER };
-    NVENC_API_CALL_RET(ctx->nvenc.nvEncCreateBitstreamBuffer(ctx->encoder, &createBitstreamBuffer), false);
-    nvencBufInfo->picParams.outputBitstream = createBitstreamBuffer.bitstreamBuffer;
-
-    nvencBufInfo->lockBitstreamData = { NV_ENC_LOCK_BITSTREAM_VER };
-    nvencBufInfo->lockBitstreamData.outputBitstream = createBitstreamBuffer.bitstreamBuffer;
-    nvencBufInfo->lockBitstreamData.doNotWait = 0;
-
-    return true;
 }
 
 void AVCEncodeBuffer(AVCEncCtx context, uint32_t colorBuffer, uint64_t inTimestamp, int reqIDRFrame, IOStream *stream, uint32_t bitrate)
@@ -607,26 +624,31 @@ void AVCEncodeBuffer(AVCEncCtx context, uint32_t colorBuffer, uint64_t inTimesta
         ctx->bitrate = bitrate;
     }
 
-    ColorBufferPtr cb = FrameBuffer::getFB()->getColorBuffer_locked(colorBuffer);
-    if (!cb) {
-        HDLOGE(":::: %s invalid colorBuffer(0x%x)\n", __FUNCTION__, colorBuffer);
-        goto err;
+    if (pauseStream && ctx->isIVS) {
+        nvencBufInfo = ctx->overwriteNvencBufInfo;
     }
-
-    tex = cb->getEGLTexture();
-    it = ctx->bufferMap.find(tex);
-    if (it == ctx->bufferMap.end()) {
-        nvencBufInfo = new NvEncBufferInfo;
-
-        // input is stored in texture backing buffer, register it
-        if (!AVCPrepareIOBuffers(ctx, nvencBufInfo, tex))
+    else {
+        ColorBufferPtr cb = FrameBuffer::getFB()->getColorBuffer_locked(colorBuffer);
+        if (!cb) {
+            HDLOGE(":::: %s invalid colorBuffer(0x%x)\n", __FUNCTION__, colorBuffer);
             goto err;
+        }
 
-        ctx->bufferMap.insert(std::pair<GLuint, NvEncBufferInfo*> (tex, nvencBufInfo));
-        avcCbSet.insert(colorBuffer);
+        tex = cb->getEGLTexture();
+        it = ctx->bufferMap.find(tex);
+        if (it == ctx->bufferMap.end()) {
+            nvencBufInfo = new NvEncBufferInfo;
+
+            // input is stored in texture backing buffer, register it
+            if (!AVCPrepareIOBuffers(ctx, nvencBufInfo, tex))
+                goto err;
+
+            ctx->bufferMap.insert(std::pair<GLuint, NvEncBufferInfo*> (tex, nvencBufInfo));
+            avcCbSet.insert(colorBuffer);
+        }
+        else
+            nvencBufInfo = it->second;
     }
-    else
-        nvencBufInfo = it->second;
 
     if (qpData.isQpEnabled)
         useQpdeltaStrategy(nvencBufInfo, bitrate);
@@ -638,7 +660,8 @@ void AVCEncodeBuffer(AVCEncCtx context, uint32_t colorBuffer, uint64_t inTimesta
 
     // encode buffer
     if (reqIDRFrame) {
-        HDLOGI("Request IDR frame\n");
+        if (!ctx->isIVS)
+            HDLOGI("Request IDR frame\n");
         nvencBufInfo->picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
         //picParams.codecPicParams.h264PicParams.constrainedFrame = 1;
     }
@@ -658,27 +681,23 @@ void AVCEncodeBuffer(AVCEncCtx context, uint32_t colorBuffer, uint64_t inTimesta
     stream->writeFully(&resIDRFrame, 4);
     stream->writeFully(nvencBufInfo->lockBitstreamData.bitstreamBufferPtr, nvencBufInfo->lockBitstreamData.bitstreamSizeInBytes);
 
-    if (qpData.isQpEnabled && dynQpAdjPtr != nullptr) {
+    if (dynQpAdjust) {
         static uint32_t suitableBrtNumInSec = 0;
-        if (bitrate > dynQpAdjPtr->dynQpDeltaAdjust_get_kLowWaterMarkBits())
+        if (bitrate > dynQpAdjust->dynQpDeltaAdjust_get_kLowWaterMarkBits())
             suitableBrtNumInSec++;
-        // step 1: check dynamic qpdelta algorithm allowed, then reset the mCalStartTime;
-        if (!dynQpAdjPtr->dynQpDeltaAdjust_get_mDynQpAdjustAllowed()) {
-            if (dynQpAdjPtr->checkDynQpAdjustAllowed(suitableBrtNumInSec, bitrate)) {
-                dynQpAdjPtr->dynQpDeltaAdjust_set_mDynQpAdjustAllowed(true);
+        if (!dynQpAdjust->dynQpDeltaAdjust_get_mDynQpAdjustAllowed()) {
+            if (dynQpAdjust->checkDynQpAdjustAllowed(suitableBrtNumInSec, bitrate)) {
+                dynQpAdjust->dynQpDeltaAdjust_set_mDynQpAdjustAllowed(true);
                 timeval curTime = {0};
                 gettimeofday(&curTime, NULL);
-                dynQpAdjPtr->dynQpDeltaAdjust_set_kCalStartTime(curTime);
+                dynQpAdjust->dynQpDeltaAdjust_set_kCalStartTime(curTime);
             }
         }
-        // step 2: calculate EncodedSize and select qpDeltaMode
-        if(dynQpAdjPtr->dynQpDeltaAdjust_get_mDynQpAdjustAllowed()) {
-            uint32_t  encodedSize = dynQpAdjPtr->dynQpDeltaAdjust_get_kTotalEncodedSizeInBytes();
+        if(dynQpAdjust->dynQpDeltaAdjust_get_mDynQpAdjustAllowed()) {
+            uint32_t  encodedSize = dynQpAdjust->dynQpDeltaAdjust_get_kTotalEncodedSizeInBytes();
             encodedSize += nvencBufInfo->lockBitstreamData.bitstreamSizeInBytes;
-            int* mode = reinterpret_cast<int*>(dynQpAdjPtr->qpDeltaModeSelect(encodedSize, suitableBrtNumInSec));
-            if (suitableBrtNumInSec == 0 && bitrate > dynQpAdjPtr->dynQpDeltaAdjust_get_kLowWaterMarkBits())
-                HDLOGE("jayden test after 1.0sec qpDeltaModeSelect bitrate: %d, kTotalEncodedSizeInByte: %d, qpmode select: %d", bitrate, encodedSize, *mode);
-            dynQpAdjPtr->dynQpDeltaAdjust_set_mQpDeltaMode(*mode);
+            int* mode = reinterpret_cast<int*>(dynQpAdjust->qpDeltaModeSelect(encodedSize, suitableBrtNumInSec));
+            dynQpAdjust->dynQpDeltaAdjust_set_mQpDeltaMode(*mode);
         }
     }
     // free resources
@@ -716,15 +735,16 @@ void AVCDestroyEncoder(AVCEncCtx context)
         delete it->second;
         it->second = NULL;
     }
-    avcCbSet.clear();
+    if (!ctx->isIVS)
+        avcCbSet.clear();
 
     if (qpData.isQpEnabled) {
         free(qpData.qpDeltaMapArray);
         qpData.qpDeltaMapArray = NULL;
         qpData.isQpEnabled = false;
-        if (dynQpAdjPtr) {
-           delete dynQpAdjPtr;
-           dynQpAdjPtr = NULL;
+        if (dynQpAdjust) {
+            delete dynQpAdjust;
+            dynQpAdjust = NULL;
         }
     }
 
@@ -735,8 +755,17 @@ void AVCDestroyEncoder(AVCEncCtx context)
     RenderThreadInfo* const tinfo = RenderThreadInfo::get();
     tinfo->m_avcEncSet.erase(context);
 
+    if (ctx->overwriteTex)
+        glDeleteTextures(1, &ctx->overwriteTex);
+    if (ctx->overwriteNvencBufInfo)
+        delete ctx->overwriteNvencBufInfo;
+
     destroyEGLResources(ctx);
-    HDLOGI("AVC encoder destroyed=0x%" PRIx64 "\n", context);
+    encSessionsCount--;
+    if (encSessionsCount <= 1) {
+        pauseStream = false;
+    }
+    HDLOGI("AVC encoder destroyed=0x%" PRIx64 " encSessionsCount=%d isIVS=%d\n", context, encSessionsCount, ctx->isIVS);
 
     delete ctx->reconfigParams.reInitEncodeParams.encodeConfig;
     delete ctx;
